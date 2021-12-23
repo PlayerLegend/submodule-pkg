@@ -127,7 +127,7 @@ static immutable_text get_build_sh_name (pkg_root * root, tar_state * state)
 	}
     }
 
-    immutable_text retval = immutable_string_range (root->namespace, &name);
+    immutable_text retval = immutable_string_range_from_log (root, &name);
     
     window_clear (contents);
 
@@ -281,7 +281,7 @@ bool pkg_install(pkg_root * root, convert_interface * interface)
 	{
 	case TAR_DIR:
 	    
-	    if (!mkdir_recursive_target(path_full.region.begin))
+	    if (!mkdir_recursive_target(&path_full.region.const_cast))
 	    {
 		log_fatal ("Could not create a package path");
 	    }
@@ -295,7 +295,7 @@ bool pkg_install(pkg_root * root, convert_interface * interface)
 		break;
 	    }
 	    
-	    if (!mkdir_recursive_parents(path_full.region.begin))
+	    if (!mkdir_recursive_parents(&path_full.region.const_cast))
 	    {
 		log_fatal ("Could not create a package path");
 	    }

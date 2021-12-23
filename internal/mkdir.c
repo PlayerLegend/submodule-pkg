@@ -13,6 +13,7 @@
 #include "../../window/string.h"
 #include "../../keyargs/keyargs.h"
 #include "../../immutable/immutable.h"
+#include "../root.h"
 #include "def.h"
 #include "mkdir.h"
 

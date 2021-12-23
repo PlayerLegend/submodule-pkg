@@ -12,16 +12,22 @@
 #include "../keyargs/keyargs.h"
 #include "root.h"
 #include "../range/def.h"
+#include "../range/string.h"
 #include "../window/def.h"
+#include "../window/string.h"
 #include "../window/alloc.h"
 #include "../window/printf.h"
 #include "../convert/def.h"
 #include "../convert/fd.h"
+#include "../convert/getline.h"
 #include "../keyargs/keyargs.h"
 #include "../immutable/immutable.h"
 #include "internal/def.h"
 #include "internal/mkdir.h"
 #include "../log/log.h"
+#include "../lang/error/error.h"
+#include "../lang/tree/tree.h"
+#include "../lang/tokenizer/tokenizer.h"
 
 /*static void load_log_file_path(pkg_root * root)
 {
@@ -87,7 +93,7 @@ static bool dump_log(pkg_root * root)
 
     set_log_file_path (&log_file_path, &root->path.region.const_cast);
         
-    if (!mkdir_recursive_parents(log_file_path.region.begin))
+    if (!mkdir_recursive_parents(&log_file_path.region.const_cast))
     {
 	log_fatal ("Could not create parent directories the package log");
     }
@@ -122,18 +128,18 @@ fail:
     return false;
 }
 
-static bool paren_config_entry_protected_paths (pkg_root * root, paren_atom * key)
+static bool paren_config_entry_protected_paths (pkg_root * root, lang_tree_node * key)
 {
-    paren_atom * i = key->peer;
+    lang_tree_node * i = key->peer;
 
     while (i)
     {
-	if (!i->child.is_text)
+	if (!i->is_text)
 	{
-	    paren_fatal (i, "Arguments to %s should be text", key->child.text);
+	    lang_log_fatal(i->source_position, "Arguments to %s should be text", key->immutable.text);
 	}
 
-	*buffer_push(root->protected_paths) = table_string_include(root->log, i->child.text)->query.key;
+	*window_push (root->protected_paths) = table_string_include(root->log, i->immutable.text)->query.key;
 	
 	i = i->peer;
     }
@@ -144,30 +150,35 @@ fail:
     return false;
 }
 
-static bool parse_config_entry (pkg_root * root, paren_atom * atom)
+static bool parse_config_entry (pkg_root * root, lang_tree_node * node)
 {
-    if (atom->child.is_text)
+    if (node->is_text)
     {
-	paren_fatal (atom, "Text node at root of config, this should be in parentheses");
+	lang_log_fatal (node->source_position, "Text node at root of config, this should be in parentheses");
     }
 
-    paren_atom * key = atom->child.atom;
+    lang_tree_node * key = node->child;
 
-    if (!key->child.is_text)
+    if (!key)
     {
-	paren_fatal (key, "Expected a text key, e.g. repos or protected-paths");
+	return true;
     }
 
-    if (0 == strcmp (key->child.text, "protect-paths"))
+    if (!key->is_text)
+    {
+	lang_log_fatal (key->source_position, "Expected a text key, e.g. repos or protected-paths");
+    }
+
+    if (0 == strcmp (key->immutable.text, "protect-paths"))
     {
 	if (!paren_config_entry_protected_paths (root, key))
 	{
-	    paren_fatal (atom, "Could not parse a protected-paths item");
+	    lang_log_fatal (key->source_position, "Could not parse a protected-paths item");
 	}
     }
     else
     {
-	paren_warning (atom, "invalid config key '%s'", key->child.text);
+	lang_log_warning(key->source_position, "Unrecognized config key '%s'", key->immutable.text);
     }
 
     return true;
@@ -176,25 +187,69 @@ fail:
     return false;
 }
 
+static lang_tree_node * gen_tree (immutable_namespace * namespace, const char * path)
+{
+    int fd = open (path, O_RDONLY);
+
+    if (fd < 0)
+    {
+	perror (path);
+	return NULL;
+    }
+
+    window_unsigned_char read_buffer = {0};
+
+    fd_interface fd_source = fd_interface_init (.fd = fd, .read_buffer = &read_buffer);
+
+    bool error = false;
+
+    lang_tree_build_env build_env;
+
+    lang_tree_build_start(&build_env);
+
+    lang_tokenizer_state tokenizer_state = { .source = &fd_source.interface };
+
+    range_const_char token;
+
+    while (tokenizer_read(&error, &token, &tokenizer_state))
+    {
+	if (!lang_tree_build_update(&build_env, &tokenizer_state.token_position, immutable_string_range(namespace, &token)))
+	{
+	    error = true;
+	    break;
+	}
+    }
+
+    lang_tree_node * retval = error ? NULL : lang_tree_build_finish(&build_env);
+
+    window_clear (read_buffer);
+    convert_clear (&fd_source.interface);
+
+    return retval;
+}
+
 static bool load_config (pkg_root * root)
 {
-    buffer_printf (&root->tmp.path, "%s/etc/pkg/config", root->path.begin);
-    const char * config_path = root->tmp.path.begin;
-
-    if (!file_exists(config_path))
+    window_char config_path = {0};
+    window_printf (&config_path, "%s/etc/pkg/config", root->path.region.begin);
+    
+    if (!file_exists(config_path.region.begin))
     {
+	window_clear (config_path);
 	return true;
     }
-    
-    paren_atom * root_atom = paren_preprocessor(.filename = config_path);
 
-    if (!root_atom)
+    immutable_namespace * config_namespace = immutable_namespace_new();
+
+    lang_tree_node * config_root = gen_tree (config_namespace, config_path.region.begin);
+    
+    if (!config_root)
     {
 	log_fatal ("Failed to load config %s", config_path);
     }
 
-    paren_atom * i = root_atom;
-
+    lang_tree_node * i = config_root;
+    
     do {
 	if (!parse_config_entry(root, i))
 	{
@@ -203,12 +258,17 @@ static bool load_config (pkg_root * root)
     }
     while ( (i = i->peer) );
 
-    paren_atom_free (root_atom);
+    window_clear (config_path);
+    lang_tree_free (config_root);
+    immutable_namespace_free(config_namespace);
     
     return true;
 
 fail:
-    paren_atom_free (root_atom);
+    window_clear (config_path);
+    lang_tree_free (config_root);
+    immutable_namespace_free(config_namespace);
+    
     return false;
 }
 
@@ -229,36 +289,41 @@ static bool parse_log_line (char ** name, char ** path, char * line)
     return (*name != *path) && **path;
 }
 
-static bool read_log_fd (pkg_root * root, int fd)
+static bool read_log_from_fd (pkg_root * root, int fd)
 {
-    buffer_char read_buffer = {0};
-    range_char line = {0};
+    window_unsigned_char read_buffer = {0};
+
+    fd_interface fd_source = fd_interface_init (.fd = fd, .read_buffer = &read_buffer);
+
+    bool error = false;
+
+    range_const_char line_range;
+    window_char line_copy = {0};
+    range_const_char end_seq;
+
+    range_string_init (&end_seq, "\n");
+    
     char * name;
     char * path;
-
     int line_number = 0;
     
-    while (buffer_getline_fd (.line = &line,
-			      .read.fd = fd,
-			      .read.buffer = &read_buffer))
+    while (convert_getline(&error, &line_range, &fd_source.interface, &end_seq))
     {
 	line_number++;
-	*line.end = '\0';
-
-	if (!parse_log_line (&name, &path, line.begin))
+	window_strcpy_range (&line_copy, &line_range);
+	if (!parse_log_line (&name, &path, line_copy.region.begin))
 	{
-	    log_fatal ("Failed to parse log line %d", line_number);
+	    log_fatal ("Failed to parse log line %d: " RANGE_FORMSPEC, line_number, RANGE_FORMSPEC_ARG(line_range));
 	}
-
-	table_string_include(root->log, path)->value.package_name = table_string_include (root->log, name)->query.key;
+	table_string_include(root->log, path)->value.package_name = immutable_string_from_log(root, name);
     }
-
-    free (read_buffer.begin);
-
+    
+    window_clear (read_buffer);
+    
     return true;
 
 fail:
-    free (read_buffer.begin);
+    window_clear (read_buffer);
     return false;
 }
 
@@ -266,9 +331,11 @@ static bool read_log (pkg_root * root)
 {
     int log_fd = -1;
     
-    load_log_file_path (root);
+    window_char log_file_path = {0};
+
+    set_log_file_path (&log_file_path, &root->path.region.const_cast);
     
-    log_fd = open (root->tmp.path.begin, O_RDONLY);
+    log_fd = open (log_file_path.region.begin, O_RDONLY);
 
     if (0 > log_fd)
     {
@@ -277,11 +344,12 @@ static bool read_log (pkg_root * root)
 	    return true;
 	}
 	
-	perror (root->path.begin);
+	perror (log_file_path.region.begin);
+	window_clear(log_file_path);
 	log_fatal ("Could not open package log file");
     }
 
-    if (!read_log_fd (root, log_fd))
+    if (!read_log_from_fd (root, log_fd))
     {
 	log_fatal ("Failed to parse package log file");
     }
@@ -303,7 +371,7 @@ pkg_root * pkg_root_open(const char * path)
 {
     pkg_root * retval = calloc (1, sizeof (*retval));
 
-    buffer_printf (&retval->path, "%s", path);
+    window_printf (&retval->path, "%s", path);
 
     if (!load_config (retval))
     {
@@ -327,10 +395,8 @@ void pkg_root_close (pkg_root * root)
     dump_log (root);
     
     table_string_clear(root->log);
-    free (root->path.begin);
-    free (root->tmp.path.begin);
-    free (root->tmp.name.begin);
-    free (root->tmp.build_sh.begin);
-    free (root->protected_paths.begin);
+    window_clear (root->tmp);
+    window_clear (root->path);
+    window_clear (root->protected_paths);
     free (root);
 }
