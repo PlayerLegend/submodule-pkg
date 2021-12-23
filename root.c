@@ -1,4 +1,3 @@
-#define _XOPEN_SOURCE 700 // for dprintf
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -14,16 +13,24 @@
 #include "root.h"
 #include "../range/def.h"
 #include "../window/def.h"
-#include "../keyargs/keyargs.h"
-#include "internal.h"
+#include "../window/alloc.h"
+#include "../window/printf.h"
 #include "../convert/def.h"
-#include "../path/path.h"
-#include "../log/log.h"
+#include "../convert/fd.h"
+#include "../keyargs/keyargs.h"
 #include "../immutable/immutable.h"
+#include "internal/def.h"
+#include "internal/mkdir.h"
+#include "../log/log.h"
 
-static void load_log_file_path(pkg_root * root)
+/*static void load_log_file_path(pkg_root * root)
 {
     buffer_printf (&root->tmp.path, "%s/" LOG_PATH, root->path.begin);
+    }*/
+
+static void set_log_file_path (window_char * target, const range_const_char * root_path)
+{
+    window_printf (target, RANGE_FORMSPEC "/" LOG_PATH, RANGE_FORMSPEC_ARG(*root_path));
 }
 
 static char * skip_isspace (char * input, bool pred)
@@ -36,24 +43,38 @@ static char * skip_isspace (char * input, bool pred)
     return input;
 }
 
-static bool dump_log_to_fd(int fd, table_string * log)
+static bool dump_log_to_interface(convert_interface * sink, table_string * log)
 {
     table_string_bucket bucket;
     table_string_item * item;
+
+    window_unsigned_char content_buffer = {0};
+    sink->write_range = &content_buffer.region.const_cast;
+    bool error = false;
+    
     for_table(bucket, *log)
     {
 	for_table_bucket(item, bucket)
 	{
-	    if (item->value.package_name)
+	    if (item->value.package_name.text)
 	    {
-		if (0 > dprintf (fd, "%s %s\n", item->value.package_name, item->query.key))
+		window_printf_append(&content_buffer.signed_cast, "%s %s\n", item->value.package_name.text, item->query.key);
+
+		if (!convert_drain(&error, sink))
+		{
+		    window_clear (content_buffer);
+		    return false;
+		}
+		/*if (0 > dprintf (fd, "%s %s\n", item->value.package_name, item->query.key))
 		{
 		    perror ("dump_log_to_fd");
 		    return false;
-		}
+		    }*/
 	    }
 	}
     }
+    
+    window_clear (content_buffer);
 
     return true;
 }
@@ -62,28 +83,33 @@ static bool dump_log(pkg_root * root)
 {
     int log_fd = -1;
 
-    load_log_file_path (root);
-    
-    if (!path_mkdir_parents(root->tmp.path.begin))
+    window_char log_file_path = {0};
+
+    set_log_file_path (&log_file_path, &root->path.region.const_cast);
+        
+    if (!mkdir_recursive_parents(log_file_path.region.begin))
     {
 	log_fatal ("Could not create parent directories the package log");
     }
     
-    log_fd = open (root->tmp.path.begin, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    log_fd = open (log_file_path.region.begin, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 
     if (log_fd < 0)
     {
-	log_fatal ("Could not open the log file at %s", root->tmp.path.begin);
+	log_fatal ("Could not open the log file at %s", log_file_path.region.begin);
     }
 
-    if (!dump_log_to_fd (log_fd, &root->log))
+    fd_interface log_fd_sink = fd_interface_init (.fd = log_fd);
+
+    if (!dump_log_to_interface (&log_fd_sink.interface, &root->log))
     {
 	log_fatal ("Could not write to log file");
     }
 
     assert (log_fd >= 0);
-    close (log_fd);
-    
+
+    convert_clear (&log_fd_sink.interface);
+        
     return true;
     
 fail:

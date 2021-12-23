@@ -2,9 +2,16 @@
 #include <stdio.h>
 #include <getopt.h>
 #include <stdlib.h>
+#include <assert.h>
 #define FLAT_INCLUDES
 #include "../keyargs/keyargs.h"
-#include "pkg.h"
+#include "../range/def.h"
+#include "../window/def.h"
+#include "../window/alloc.h"
+#include "../convert/def.h"
+#include "../convert/fd.h"
+#include "root.h"
+#include "install.h"
 #include "../log/log.h"
 
 #define STDIN_FILENO 0
@@ -62,10 +69,17 @@ int main(int argc, char * argv[])
     else
     {
 	log_debug ("installing from stdin");
-	if (!pkg_install_fd (root, STDIN_FILENO))
+
+	window_unsigned_char read_buffer = {0};
+	
+	fd_interface fd_read = fd_interface_init (.fd = STDIN_FILENO, .read_buffer = &read_buffer);
+	
+	if (!pkg_install (root,&fd_read.interface))
 	{
 	    log_fatal ("Failed installing package from stdin");
 	}
+
+	window_clear (read_buffer);
     }
 
     pkg_root_close(root);

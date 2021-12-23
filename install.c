@@ -8,6 +8,7 @@
 #define FLAT_INCLUDES
 #include "../range/def.h"
 #include "../window/def.h"
+#include "../window/path.h"
 #include "../convert/def.h"
 #include "../keyargs/keyargs.h"
 #include "root.h"
@@ -16,12 +17,12 @@
 #include "../window/alloc.h"
 #include "../window/string.h"
 #include "../keyargs/keyargs.h"
-#include "internal.h"
+#include "../immutable/immutable.h"
+#include "internal/def.h"
+#include "internal/mkdir.h"
 #include "../tar/common.h"
 #include "../tar/read.h"
 #include "../log/log.h"
-#include "../path/path.h"
-#include "../immutable/immutable.h"
 #include "../convert/fd.h"
 
 /*static bool read_file_contents (window_char * output, tar_state * state, int fd)
@@ -63,14 +64,26 @@ typedef struct {
 }
     build_sh_info;
 
-static const char * get_build_sh_name (pkg_root * root, const range_const_unsigned_char * contents)
+static immutable_text get_build_sh_name (pkg_root * root, tar_state * state)
 {
-    range_const_char name = contents->char_cast.const_cast;
+    window_unsigned_char contents = {0};
+    
+    if (!verify_build_sh_name(state)) // verify that this file is build.sh
+    {
+	log_fatal ("Invalid file for build.sh");
+    }
+
+    if (!tar_read_file_whole(&contents, state))
+    {
+	log_fatal ("Failed to read build.sh from package");
+    }
+    
+    range_const_char name = contents.region.char_cast.const_cast;
 
     #define NAME_LINE_PREFIX_TEXT "PKG_NAME="
     #define NAME_LINE_PREFIX_LEN 9
     
-    name.begin += range_strstr_string(&contents->char_cast.const_cast, NAME_LINE_PREFIX_TEXT);
+    name.begin += range_strstr_string(&contents.region.char_cast.const_cast, NAME_LINE_PREFIX_TEXT);
     
     if (range_count (name) < NAME_LINE_PREFIX_LEN)
     {
@@ -113,25 +126,35 @@ static const char * get_build_sh_name (pkg_root * root, const range_const_unsign
 	    log_fatal ("Whitespace in package name");
 	}
     }
-    
 
-    return immutable_range (root->namespace, &name);
+    immutable_text retval = immutable_string_range (root->namespace, &name);
+    
+    window_clear (contents);
+
+    return retval;
     
 fail:
-    return NULL;
+    
+    window_clear (contents);
+    
+    return (immutable_text){0};
 }
 
 #define take_ownership(...) keyargs_call(take_ownership, __VA_ARGS__)
 keyargs_declare_static(bool, take_ownership,
 		       pkg_root * root;
-		       const char * package_name;
+		       immutable_text package_name;
 		       const char * file_path;);
 
 keyargs_define_static(take_ownership)
 {
+    assert (args.root);
+    assert (args.package_name.text);
+    assert (args.file_path);
+    
     table_string_item * path_item = table_string_include (args.root->log, args.file_path);
 
-    if (path_item->value.package_name && path_item->value.package_name != args.package_name)
+    if (path_item->value.package_name.text && path_item->value.package_name.text != args.package_name.text)
     {
 	log_fatal ("Path %s is owned by %s, cannot allocate for %s", args.file_path, path_item->value.package_name, args.package_name);
     }
@@ -189,6 +212,8 @@ static bool write_file (const char * path, tar_state * state)
     range_const_unsigned_char file_part;
 
     fd_interface out_interface = fd_interface_init(.fd = open (path, O_WRONLY | O_CREAT, state->mode), .write_range = &file_part);
+
+    bool error = false;
     
     if (out_interface.fd < 0)
     {
@@ -196,15 +221,15 @@ static bool write_file (const char * path, tar_state * state)
 	log_fatal ("Could not open ouput file");
     }
 
-    while (tar_read_file_part (&file_part, state))
+    while (tar_read_file_part (&error, &file_part, state))
     {
-	if (!convert_drain (&out_interface.interface))
+	if (!convert_drain (&error, &out_interface.interface))
 	{
 	    log_fatal ("Failed to write to file");
 	}
     }
 
-    if (state->type == TAR_ERROR || state->source->error)
+    if (state->type == TAR_ERROR || error)
     {
 	log_fatal ("A read error occurred");
     }
@@ -229,7 +254,6 @@ bool tar_update_compressed_fd (compressed_tar_state * state)
 bool pkg_install(pkg_root * root, convert_interface * interface)
 {
     tar_state state = { .source = interface };
-    window_unsigned_char build_sh_contents = {0};
 
     while (tar_update (&state) && state.type != TAR_FILE) // skip to first file, which should be build.sh
     {
@@ -244,22 +268,55 @@ bool pkg_install(pkg_root * root, convert_interface * interface)
 	log_fatal ("Encountered an error while searching for a file");
     }
 
-    if (!verify_build_sh_name(&state)) // verify that this file is build.sh
-    {
-	log_fatal ("Invalid file for build.sh");
-    }
+    immutable_text pkg_name = get_build_sh_name (root, &state);
 
-    if (!tar_read_file_whole(&build_sh_contents, &state))
+    window_char path_full = {0};
+
+    while (tar_update (&state))
     {
-	log_fatal ("Failed to read build.sh from package");
+	window_strcpy_range (&path_full, &root->path.region.const_cast);
+	window_path_cat(&path_full, PATH_SEPARATOR, &state.path.region.const_cast);
+	
+	switch (state.type)
+	{
+	case TAR_DIR:
+	    
+	    if (!mkdir_recursive_target(path_full.region.begin))
+	    {
+		log_fatal ("Could not create a package path");
+	    }
+	    break;
+
+	case TAR_FILE:
+	    if (file_exists (pkg_name.text) && is_protected (root, path_full.region.begin))
+	    {
+		log_normal ("File %s exists and is protected", path_full.region.begin);
+		tar_skip_file(&state);
+		break;
+	    }
+	    
+	    if (!mkdir_recursive_parents(path_full.region.begin))
+	    {
+		log_fatal ("Could not create a package path");
+	    }
+
+	    if (!take_ownership (.root = root, .package_name = pkg_name, .file_path = state.path.region.begin))
+	    {
+		log_fatal ("Cannot set package ownership of file, failed to install: %s", path_full.region.begin);
+	    }
+	    
+	    if (!write_file (path_full.region.begin, &state))
+	    {
+		log_fatal ("Could not write file %s", path_full.region.begin);
+	    }
+	    break;
+	    
+	default:
+	    log_fatal ("Unimplimented tar item type %d", state.type);
+	}
     }
     
-    if (!parse_build_sh(root, root->tmp.build_sh.begin))
-    {
-	log_fatal ("Failed to parse build.sh");
-    }
-
-    while (tar_update_fd(&state, fd))
+    /*while (tar_update_fd(&state, fd))
     {
 	path_cat (&root->tmp.path, root->path.begin, state.path.begin);
 	//window_printf (&root->tmp.path, "%s/%s", root->path.begin, state.path.begin);
@@ -304,13 +361,15 @@ bool pkg_install(pkg_root * root, convert_interface * interface)
 	default:
 	    continue;
 	}
-    }
+	}*/
 
+    window_clear (path_full);
     tar_cleanup (&state);
     
     return true;
 
 fail:
+    window_clear (path_full);
     tar_cleanup (&state);
     return false;
 }
