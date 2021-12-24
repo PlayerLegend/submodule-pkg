@@ -17,8 +17,10 @@
 #include "../window/string.h"
 #include "../window/alloc.h"
 #include "../window/printf.h"
-#include "../convert/def.h"
-#include "../convert/fd.h"
+#include "../convert/source.h"
+#include "../convert/fd/source.h"
+#include "../convert/sink.h"
+#include "../convert/fd/sink.h"
 #include "../convert/getline.h"
 #include "../keyargs/keyargs.h"
 #include "../immutable/immutable.h"
@@ -49,13 +51,13 @@ static char * skip_isspace (char * input, bool pred)
     return input;
 }
 
-static bool dump_log_to_interface(convert_interface * sink, table_string * log)
+static bool dump_log_to_interface(convert_sink * sink, table_string * log)
 {
     table_string_bucket bucket;
     table_string_item * item;
 
     window_unsigned_char content_buffer = {0};
-    sink->write_range = &content_buffer.region.const_cast;
+    sink->contents = &content_buffer.region.const_cast;
     bool error = false;
     
     for_table(bucket, *log)
@@ -105,16 +107,16 @@ static bool dump_log(pkg_root * root)
 	log_fatal ("Could not open the log file at %s", log_file_path.region.begin);
     }
 
-    fd_interface log_fd_sink = fd_interface_init (.fd = log_fd);
+    fd_sink log_fd_sink = fd_sink_init (.fd = log_fd);
 
-    if (!dump_log_to_interface (&log_fd_sink.interface, &root->log))
+    if (!dump_log_to_interface (&log_fd_sink.sink, &root->log))
     {
 	log_fatal ("Could not write to log file");
     }
 
     assert (log_fd >= 0);
 
-    convert_clear (&log_fd_sink.interface);
+    convert_sink_clear (&log_fd_sink.sink);
         
     return true;
     
@@ -199,7 +201,7 @@ static lang_tree_node * gen_tree (immutable_namespace * namespace, const char * 
 
     window_unsigned_char read_buffer = {0};
 
-    fd_interface fd_source = fd_interface_init (.fd = fd, .read_buffer = &read_buffer);
+    fd_source fd_source = fd_source_init (.fd = fd, .contents = &read_buffer);
 
     bool error = false;
 
@@ -207,7 +209,7 @@ static lang_tree_node * gen_tree (immutable_namespace * namespace, const char * 
 
     lang_tree_build_start(&build_env);
 
-    lang_tokenizer_state tokenizer_state = { .source = &fd_source.interface };
+    lang_tokenizer_state tokenizer_state = { .source = &fd_source.source };
 
     range_const_char token;
 
@@ -223,7 +225,7 @@ static lang_tree_node * gen_tree (immutable_namespace * namespace, const char * 
     lang_tree_node * retval = error ? NULL : lang_tree_build_finish(&build_env);
 
     window_clear (read_buffer);
-    convert_clear (&fd_source.interface);
+    convert_source_clear (&fd_source.source);
 
     return retval;
 }
@@ -293,7 +295,7 @@ static bool read_log_from_fd (pkg_root * root, int fd)
 {
     window_unsigned_char read_buffer = {0};
 
-    fd_interface fd_source = fd_interface_init (.fd = fd, .read_buffer = &read_buffer);
+    fd_source fd_source = fd_source_init (.fd = fd, .contents = &read_buffer);
 
     bool error = false;
 
@@ -307,7 +309,7 @@ static bool read_log_from_fd (pkg_root * root, int fd)
     char * path;
     int line_number = 0;
     
-    while (convert_getline(&error, &line_range, &fd_source.interface, &end_seq))
+    while (convert_getline(&error, &line_range, &fd_source.source, &end_seq))
     {
 	line_number++;
 	window_strcpy_range (&line_copy, &line_range);

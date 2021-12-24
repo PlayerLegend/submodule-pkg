@@ -9,8 +9,10 @@
 #include "../range/def.h"
 #include "../window/def.h"
 #include "../window/path.h"
-#include "../convert/def.h"
 #include "../keyargs/keyargs.h"
+#include "../convert/source.h"
+#include "../convert/sink.h"
+#include "../convert/fd/sink.h"
 #include "root.h"
 #include "install.h"
 #include "../range/string.h"
@@ -23,7 +25,6 @@
 #include "../tar/common.h"
 #include "../tar/read.h"
 #include "../log/log.h"
-#include "../convert/fd.h"
 
 /*static bool read_file_contents (window_char * output, tar_state * state, int fd)
 {
@@ -211,11 +212,11 @@ static bool write_file (const char * path, tar_state * state)
     
     range_const_unsigned_char file_part;
 
-    fd_interface out_interface = fd_interface_init(.fd = open (path, O_WRONLY | O_CREAT, state->mode), .write_range = &file_part);
+    fd_sink fd_sink = fd_sink_init(.fd = open (path, O_WRONLY | O_CREAT, state->mode), .contents = &file_part);
 
     bool error = false;
     
-    if (out_interface.fd < 0)
+    if (fd_sink.fd < 0)
     {
 	perror (path);
 	log_fatal ("Could not open ouput file");
@@ -223,7 +224,7 @@ static bool write_file (const char * path, tar_state * state)
 
     while (tar_read_file_part (&error, &file_part, state))
     {
-	if (!convert_drain (&error, &out_interface.interface))
+	if (!convert_drain (&error, &fd_sink.sink))
 	{
 	    log_fatal ("Failed to write to file");
 	}
@@ -241,7 +242,6 @@ fail:
 }
 
 typedef struct {
-    pkg_pack_compression_type compression_type;
     tar_state state;
 }
     compressed_tar_state;
@@ -251,9 +251,9 @@ bool tar_update_compressed_fd (compressed_tar_state * state)
     return false;
 }
 
-bool pkg_install(pkg_root * root, convert_interface * interface)
+bool pkg_install(pkg_root * root, convert_source * source)
 {
-    tar_state state = { .source = interface };
+    tar_state state = { .source = source };
 
     while (tar_update (&state) && state.type != TAR_FILE) // skip to first file, which should be build.sh
     {

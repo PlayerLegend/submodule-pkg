@@ -8,8 +8,8 @@
 #include "../range/def.h"
 #include "../window/def.h"
 #include "../window/alloc.h"
-#include "../convert/def.h"
-#include "../convert/fd.h"
+#include "../convert/source.h"
+#include "../convert/fd/source.h"
 #include "root.h"
 #include "install.h"
 #include "../log/log.h"
@@ -72,9 +72,9 @@ int main(int argc, char * argv[])
 
 	window_unsigned_char read_buffer = {0};
 	
-	fd_interface fd_read = fd_interface_init (.fd = STDIN_FILENO, .read_buffer = &read_buffer);
+	fd_source fd_source = fd_source_init (.fd = STDIN_FILENO, .contents = &read_buffer);
 	
-	if (!pkg_install (root,&fd_read.interface))
+	if (!pkg_install (root,&fd_source.source))
 	{
 	    log_fatal ("Failed installing package from stdin");
 	}

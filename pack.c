@@ -9,75 +9,65 @@
 #include <string.h>
 #define FLAT_INCLUDES
 #include "../keyargs/keyargs.h"
-#include "pkg.h"
+#include "root.h"
 #include "../range/def.h"
+#include "../range/string.h"
 #include "../window/def.h"
+#include "../window/string.h"
+#include "../window/path.h"
+#include "../convert/sink.h"
 #include "../tar/common.h"
+#include "../window/alloc.h"
 #include "../tar/write.h"
 #include "../log/log.h"
-#include "../convert/def.h"
-#include "../path/path.h"
+#include "pack.h"
 
 #define FILE_BUFFER_SIZE (int)1e6
 
 struct pkg_pack_state {
-    int output_fd;
+    convert_sink * package_sink;
     window_unsigned_char tar_buffer;
-    window_unsigned_char compress_buffer;
     size_t name_skip;
 };
 
 static void pkg_pack_state_free (pkg_pack_state * state)
 {
-    free (state->tar_buffer.begin);
-    free (state->compress_buffer.begin);
-    dzip_deflate_state_free(state->dzip_deflate_state);
+    window_clear (state->tar_buffer);
     free (state);
 }
 
 keyargs_define(pkg_pack_new)
 {
     pkg_pack_state * retval = calloc (1, sizeof(*retval));
-    retval->output_fd = args.output_fd;
-    retval->dzip_deflate_state = args.compression_type == PKG_PACK_COMPRESSION_DZIP ? dzip_deflate_state_new() : NULL;
+    tar_type type = TAR_ERROR;
+    window_unsigned_char buffer = {0};
 
-    buffer_unsigned_char * script_buffer = &retval->compress_buffer; // a hack
-
-    long int size;
-    while (0 < (size = buffer_read (.buffer = &script_buffer->char_cast,
-				    .fd = args.script_fd)))
-    {}
-
-    if (size < 0)
-    {
-	log_fatal ("Failed to read build script");
-    }
+    retval->package_sink = args.sink;
     
-    if (!tar_write_header (.output = &retval->tar_buffer.char_cast,
-			   .name = "build.sh",
-			   .mode = 0700,
-			   .size = range_count (*script_buffer),
-			   .type = TAR_FILE))
+    if (!tar_write_sink_path(.sink = retval->package_sink,
+			     .path = args.script_path,
+			     .buffer = &buffer,
+			     .override_name = "build.sh",
+			     .detect_type = &type))
     {
-	log_fatal ("Failed to add build script to tar");
+	goto fail;
     }
 
-    log_debug ("read file: %s", script_buffer->begin);
-    
-    buffer_append(retval->tar_buffer, *script_buffer);
+    if (type != TAR_FILE)
+    {
+	log_fatal ("Script path does not refer to a file: %s", args.script_path);
+    }
 
-    tar_write_padding(&retval->tar_buffer.char_cast, range_count(*script_buffer));
-    log_debug ("tar size %zu", range_count (retval->tar_buffer));
-
-    buffer_rewrite(*script_buffer); // clean up after the hack
+    window_clear (buffer);
     
     return retval;
 
 fail:
+    window_clear (buffer);
     pkg_pack_state_free (retval);
     return NULL;
 }
-
+/*
 static bool flush_buffer_to_fd (int fd, buffer_unsigned_char * buffer)
 {
     if (range_is_empty(*buffer))
@@ -150,9 +140,9 @@ static bool optional_flush_buffers (pkg_pack_state * state)
 
 fail:
     return false;
-}
+    }*/
 
-static bool pkg_pack_path_sub(pkg_pack_state * state, const char * path);
+/*static bool pkg_pack_path_sub(pkg_pack_state * state, const char * path);
 static bool pkg_pack_file(pkg_pack_state * state, const char * path, size_t size)
 {
     int file_fd = open (path, O_RDONLY);
@@ -197,20 +187,58 @@ static bool pkg_pack_file(pkg_pack_state * state, const char * path, size_t size
     return true;
 
 fail:
-    if (file_fd >= 0)
+    window_clear (contents);
+    convert_source_clear (&source.source);
+    return false;
+    }*/
+
+static bool pkg_pack_dir(window_unsigned_char * file_buffer, pkg_pack_state * state, const char * path);
+static bool pkg_pack_path_sub(window_unsigned_char * file_buffer, pkg_pack_state * state, const char * path)
+{
+    log_debug ("packing path %s", path);
+
+    tar_type type;
+
+    if (state->name_skip > strlen(path))
     {
-	close(file_fd);
+	log_fatal ("Name skip too long, %zu > %zu", state->name_skip, strlen(path));
     }
+
+    if (!tar_write_sink_path (.sink = state->package_sink,
+			      .path = path,
+			      .buffer = file_buffer,
+			      .override_name = path + state->name_skip,
+			      .detect_type = &type))
+    {
+	log_fatal ("Failed to write path");
+    }
+
+    if (type == TAR_DIR)
+    {
+	return pkg_pack_dir (file_buffer, state, path);
+    }
+    else
+    {
+	return true;
+    }
+
+fail:
     return false;
 }
 
-
-static bool pkg_pack_dir(pkg_pack_state * state, const char * path)
+static bool pkg_pack_dir(window_unsigned_char * file_buffer, pkg_pack_state * state, const char * path)
 {
     DIR * dir = opendir (path);
     struct dirent * ent;
 
-    buffer_char path_buffer = {0};
+    window_char path_buffer = {0};
+
+    window_strcpy (&path_buffer, path);
+
+    size_t base_path_length = range_count (path_buffer.region);
+    range_const_char ent_name;
+
+    #define PATH_SEPARATOR '/'
     
     while ( (ent = readdir (dir)) )
     {
@@ -219,64 +247,42 @@ static bool pkg_pack_dir(pkg_pack_state * state, const char * path)
 	    continue;
 	}
 
-	path_cat(&path_buffer, path, ent->d_name);
-	//buffer_printf (&path_buffer, "%s%s%s", path, ends_with(path,PATH_SEPARATOR) ? "" : , ent->d_name);
-	if (!pkg_pack_path_sub (state, path_buffer.begin))
+	path_buffer.region.end = path_buffer.region.begin + base_path_length;
+	assert (path_buffer.region.end >= path_buffer.alloc.begin && path_buffer.region.end < path_buffer.alloc.end);
+	
+	range_string_init(&ent_name, ent->d_name);
+	window_path_cat (&path_buffer, PATH_SEPARATOR, &ent_name);
+
+	if (!pkg_pack_path_sub (file_buffer, state, path_buffer.region.begin))
 	{
 	    goto fail;
 	}
     }
 
-    free (path_buffer.begin);
+    window_clear (path_buffer);
     closedir (dir);
     return true;
 
 fail:
-    free (path_buffer.begin);
+    window_clear (path_buffer);
     closedir (dir);
     return false;
 }
 
-static bool pkg_pack_path_sub(pkg_pack_state * state, const char * path)
-{
-    unsigned long long size;
-    tar_type type;
-
-    assert (state->name_skip <= strlen(path));
-
-    if (!tar_write_path_header(.output = &state->tar_buffer.char_cast,
-			       .detect_type = &type,
-			       .detect_size = &size,
-			       .override_name = path + state->name_skip,
-			       .path = path))
-    {
-	log_fatal ("Could not write tar header");
-    }
-
-    log_debug ("packing path %s", path);
-
-    switch (type)
-    {
-    case TAR_FILE:    return pkg_pack_file(state, path, size);
-    case TAR_DIR:     return pkg_pack_dir(state, path);
-    case TAR_SYMLINK: return true;
-    default: log_fatal("Invalid tar type for pkg file");
-    }
-
-    return true;
-
-fail:
-    return false;
-}
 
 bool pkg_pack_path(pkg_pack_state * state, const char * path)
 {
     state->name_skip = strlen (path);
-    return pkg_pack_path_sub (state, path);
+    window_unsigned_char file_buffer = {0};
+    
+    bool retval = pkg_pack_path_sub (&file_buffer, state, path);
+
+    window_clear (file_buffer);
+
+    return retval;
 }
 
 bool pkg_pack_finish (pkg_pack_state * state)
 {
-    tar_write_end(&state->tar_buffer.char_cast);
-    return flush_tar_buffer(state) && flush_compress_buffer(state);
+    return tar_write_sink_end(state->package_sink);
 }
